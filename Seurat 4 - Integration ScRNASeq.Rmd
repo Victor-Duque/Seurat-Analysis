@@ -1,0 +1,155 @@
+---
+title: "SON Data"
+author: "Victor Duque"
+date: "2023-10-08"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+#Library
+```{r}
+setwd("A:/Bioinformatica/Treino")
+library(Seurat)
+library(ggplot2)
+library(writexl)
+library(tidyverse)
+library(SoupX)
+library(DropletUtils)
+library(DoubletFinder)
+```
+
+#Functions
+```{r warning=FALSE}
+mad_outlier = function(X, metric, nmads){
+  M = X@meta.data[[metric]]
+  median_M = median(M, na.rm = TRUE)
+  mad_M = mad(M, na.rm = TRUE)
+  outlier = (M < (median_M - nmads * mad_M)) | (M > (median_M + nmads * mad_M))
+  return(outlier)}
+
+Seurat_Object_QC = function(Sample){
+  filt.matrix <- Read10X(paste0("Data/",Sample,"/filtered_feature_bc_matrix"))
+  raw.matrix  <- Read10X(paste0("Data/",Sample,"/raw_feature_bc_matrix"))
+  srat  <- CreateSeuratObject(counts = filt.matrix, project = Sample)
+  soup.channel  <- SoupChannel(raw.matrix, filt.matrix)
+  srat <- NormalizeData(srat)
+  srat <- FindVariableFeatures(srat, selection.method = "vst")
+  all.genes <- rownames(srat)
+  srat <- ScaleData(srat, features = all.genes)
+  srat    <- RunPCA(srat, verbose = F)
+  print(ElbowPlot(srat,30))
+  ggsave(paste0("QC/ElbowPlot_",Sample,".png"), width = 5, height = 4)
+  srat    <- RunUMAP(srat, dims = 1:20, verbose = F)
+  srat    <- FindNeighbors(srat, dims = 1:20, verbose = F)
+  srat    <- FindClusters(srat, verbose = T)
+  meta    <- srat@meta.data
+  umap    <- srat@reductions$umap@cell.embeddings
+  soup.channel  <- setClusters(soup.channel, setNames(meta$seurat_clusters, rownames(meta)))
+  soup.channel  <- setDR(soup.channel, umap)
+  soup.channel  <- autoEstCont(soup.channel, forceAccept = T)
+  X  <- adjustCounts(soup.channel, roundToInt = T)
+  DropletUtils:::write10xCounts(paste0("Final_Data/",Sample,"_Final"), X, version = "3")
+  X  <- Read10X(paste0("Final_Data/",Sample,"_Final/"))
+  X  <- CreateSeuratObject(counts = X, project = Sample)
+  Cells_Before = as.numeric(length(Cells(X)))
+  X$log1p_total_counts = log1p(X@meta.data$nCount_RNA)
+  X$log1p_n_genes_by_counts = log1p(X@meta.data$nFeature_RNA)
+  X[["percent.mt"]] = PercentageFeatureSet(X, pattern = "^Mt-")
+  bool_vector = !mad_outlier(X, 'log1p_total_counts', 5) & 
+                !mad_outlier(X, 'log1p_n_genes_by_counts', 5)
+  #X = subset(X, cells = which(bool_vector))
+  X<- subset(X, subset = nFeature_RNA > 700 & nFeature_RNA < 3600)
+  X= subset(X, subset = percent.mt < 1)
+  Count = data.frame(Base = as.numeric(length(as.numeric(Idents(srat)))), 
+                     QC = as.numeric(length(as.numeric(Idents(X)))))
+  Count$ID = Sample
+  write.csv(Count, paste0("QC/",Sample,"_QC_Cells.csv"))
+  saveRDS(X, paste0("RDS/",Sample,"_AfterQC.rds"))
+  return(X)}
+
+
+DoubletFinder_Correction = function(Sample){
+  X = readRDS(paste0("RDS/",Sample,"_AfterQC.rds"))
+  srat <- NormalizeData(X)
+  srat <- FindVariableFeatures(srat, selection.method = "vst")
+  all.genes <- rownames(srat)
+  srat <- ScaleData(srat, features = all.genes)
+  srat    <- RunPCA(srat, verbose = F)
+  print(ElbowPlot(srat,30))
+  ggsave(paste0("QC/ElbowPlot_",Sample,".png"), width = 5, height = 4)
+  srat    <- RunUMAP(srat, dims = 1:20, verbose = F)
+  srat    <- FindNeighbors(srat, dims = 1:20, verbose = F)
+  srat    <- FindClusters(srat, verbose = T)
+  sweep.list_SON <- paramSweep_v3(srat, PCs = 1:20, sct = FALSE)
+  sweep.stats_SON <- summarizeSweep(sweep.list_SON, GT = FALSE)
+  bcmvn_SON <- find.pK(sweep.stats_SON)
+  pK <- bcmvn_SON %>%
+    filter(BCmetric == max(BCmetric)) %>%
+    select(pK) 
+  pK <- as.numeric(as.character(pK[[1]]))
+  annotations <- X@meta.data$seurat_clusters
+  homotypic.prop <- modelHomotypic(annotations)
+  nExp_poi <- round(0.046*nrow(X@meta.data)) 
+  nExp_poi.adj <- round(nExp_poi*(1-homotypic.prop))
+  X <- doubletFinder_v3(srat,
+                                       PCs = 1:20, 
+                                       pN = 0.25, 
+                                       pK = pK, 
+                                       nExp = nExp_poi.adj,
+                                       reuse.pANN = FALSE, sct = FALSE, )
+  colnames(X@meta.data)[10] <- "DoubletFinder"
+  DimPlot(X, group.by = "DoubletFinder")
+  ggsave(paste0("Doublet_",Sample,".png"), width = 5, height = 5)
+  X = subset(X, subset = DoubletFinder != "Doublet")
+  Count = data.frame(Base = as.numeric(length(as.numeric(Idents(srat)))), 
+                     QC = as.numeric(length(as.numeric(Idents(X)))))
+  write.csv(Count, paste0("QC/",Sample,"_Doublet_QC_Cells.csv"))
+  saveRDS(X, paste0("RDS/",Sample,"_Final.rds"))
+}
+```
+
+#Loop
+```{r}
+List = c(paste0("SON_", seq(2,10)))
+         
+for (i in List) {
+  print(paste0("Starting with: ",i))
+  Seurat_Object_QC(i)
+  DoubletFinder_Correction(i)
+  print(paste0("Finished: ",i))
+}
+seurat_list <- list()
+for (x in List) {
+  seurat_obj <- readRDS(paste0("RDS/",x,"_Final.rds"))
+  seurat_list[[x]] <- seurat_obj
+}
+for (i in 1:length(seurat_list)) {
+  seurat_list[[i]] <- NormalizeData(seurat_list[[i]], verbose = FALSE)
+  seurat_list[[i]] <- FindVariableFeatures(seurat_list[[i]], selection.method = "vst",
+                                       nfeatures = 2000, verbose = FALSE)
+}
+saveRDS(seurat_list, "Seurat_List.rds")
+seurat_list = readRDS("Seurat_List.rds")
+anchors <- FindIntegrationAnchors(object.list = seurat_list)
+SON <- IntegrateData(anchorset = anchors)
+saveRDS(SON, "RDS/Son_Data.rds")
+```
+
+```{r}
+SON = readRDS("RDS/Son_Data.rds")
+DefaultAssay(SON) <- "integrated"
+SON <- ScaleData(SON, verbose = FALSE)
+SON <- RunPCA(SON, npcs = 30, verbose = FALSE)
+ElbowPlot(SON,30)
+#ggsave("ElbowPlot.tiff", width = 5, height = 5)
+SON <- RunPCA(SON, npcs = 20, verbose = FALSE)
+SON = RunUMAP(SON, reduction = "pca",dims = 1:20)
+SON <- FindNeighbors(SON, reduction = "pca",dims = 1:20)
+SON <- FindClusters(SON, resolution = 1)
+DimPlot(SON, raster = F)
+FeaturePlot(SON, "Avp", raster = F)
+#ggsave("SON_BaseCluster.tiff", width = 5, height = 5)
+```
+
+
